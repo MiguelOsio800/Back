@@ -27,7 +27,8 @@ export const getRemesas = async (req, res) => {
 };
 
 export const createRemesa = async (req, res) => {
-    const { vehicleId, invoiceIds, exchangeRate, asociadoId } = req.body; 
+    // 1. AÑADIDO: Recibimos cooperativeAmount desde el frontend
+    const { vehicleId, invoiceIds, exchangeRate, asociadoId, cooperativeAmount } = req.body; 
     const t = await sequelize.transaction();
     
     try {
@@ -49,7 +50,7 @@ export const createRemesa = async (req, res) => {
             throw new Error('Una o más facturas no fueron encontradas en la base de datos.');
         }
 
-        // 2. CÁLCULOS SEGUROS
+        // 2. CÁLCULOS SEGUROS DE TOTALES, PESO Y PAQUETES
         const totalAmount = invoices.reduce((sum, inv) => sum + (Number(inv.totalAmount) || 0), 0);
         
         let totalPackages = 0;
@@ -64,58 +65,10 @@ export const createRemesa = async (req, res) => {
         });
 
         // ==========================================
-        // 3. NUEVO CÁLCULO DE COMISIÓN Y SALDOS
+        // 3. NUEVO CÁLCULO DE COMISIÓN 
         // ==========================================
-        let totalPagado = 0;
-        let totalDestino = 0;
-        
-        let cargosDestino = 0;    // Suma de Coop+Seguro+Ipostel+Manejo SOLO de Destino
-        let favorSocioPagado = 0; // Suma del favor socio (70%) SOLO de las Pagadas
-
-        invoices.forEach(inv => {
-            const montoFactura = Number(inv.totalAmount) || 0;
-            const seguro = Number(inv.insuranceAmount) || 0;
-            const ipostel = Number(inv.ipostelFee) || 0;
-            const manejo = Number(inv.Montomanejo) || 0;
-            const iva = 0; // <-- NOTA: Si el IVA está en otro campo, debes sumarlo aquí.
-
-            // Calcular favor coop base de esta factura individual
-            const tipo = (inv.shippingType || '').toLowerCase();
-            const porcentaje = (tipo.includes('franquicia') || tipo.includes('expreso') || tipo.includes('mudanza')) ? 0.15 : 0.30;
-            const favorCoop = montoFactura * porcentaje;
-
-            // Total de cargos extras de esta factura individual
-            const cargosExtrasFactura = favorCoop + seguro + ipostel + manejo + iva;
-
-            // Separar montos por estado de pago (Pagada = Efectivo en Origen, Pendiente = Efectivo en Destino)
-            if (inv.paymentStatus === 'Pagada') {
-                totalPagado += montoFactura;
-                // Calculamos el 70% del socio solo de las facturas que él ya cobró
-                favorSocioPagado += (montoFactura * 0.70); 
-            } else {
-                totalDestino += montoFactura;
-                // Sumamos los cargos extras SOLO si la factura es de cobro en destino
-                cargosDestino += cargosExtrasFactura;
-            }
-        });
-
-        let cooperativeAmount = 0;
-
-        // Lógica de Escenarios
-        if (totalDestino === 0 && totalPagado > 0) {
-            // Escenario 3: Solo Pagado. El socio se queda con el 70%.
-            const favorSocio = totalPagado * 0.70;
-            cooperativeAmount = totalPagado - favorSocio; // El socio debe este resto a la cooperativa
-        } 
-        else if (totalPagado === 0 && totalDestino > 0) {
-            // Escenario 4: Solo Destino. La cooperativa cobra y se queda con sus extras
-            cooperativeAmount = cargosDestino;
-        } 
-        else {
-            // Escenario Mixto (El caso que mencionaste)
-            // Tu regla estricta: cargos destino (coop+seguro+ipostel+manejo+iva) - favor soc (pagado)
-            cooperativeAmount = cargosDestino - favorSocioPagado;
-        }
+        // Usamos lo que diga el frontend. Si no lo envía, aplicamos el 100% por seguridad.
+        const finalCooperativeAmount = cooperativeAmount !== undefined ? Number(cooperativeAmount) : totalAmount;
 
         // ==========================================
         // 4. BUSCAR INFO DEL SOCIO, OFICINA Y ÚLTIMA REMESA
@@ -174,7 +127,7 @@ export const createRemesa = async (req, res) => {
             invoiceIds: invoiceIds, 
             date: req.body.date || new Date().toISOString().split('T')[0],
             totalAmount: totalAmount,
-            cooperativeAmount: cooperativeAmount,
+            cooperativeAmount: finalCooperativeAmount, // <-- APLICAMOS EL VALOR FINAL AQUÍ
             totalPackages: totalPackages,
             totalWeight: totalWeight,
             exchangeRate: Number(exchangeRate) || 1.00,

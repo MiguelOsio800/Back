@@ -1,0 +1,108 @@
+import jwt from 'jsonwebtoken';
+import { User, Role } from '../models/index.js';
+
+// Middleware para proteger rutas, asegurando que el usuario esté logueado.
+export const protect = async (req, res, next) => {
+    let token;
+
+    // --- CAMBIO PRINCIPAL: Buscamos el token en la cabecera Authorization ---
+    if (req.headers.authorization && req.headers.authorization.startsWith('Bearer')) {
+        try {
+            // 1. Obtenemos el token de la cabecera 'Bearer <token>'
+            token = req.headers.authorization.split(' ')[1];
+            
+            // 2. Verificamos el token con la clave secreta del .env
+            const decoded = jwt.verify(token, process.env.JWT_SECRET);
+
+            // 3. Obtenemos el usuario del token y adjuntamos su Rol y permisos.
+            req.user = await User.findByPk(decoded.id, {
+                attributes: { exclude: ['password'] }, // Excluimos la contraseña por seguridad
+                include: {
+                    model: Role, // Incluimos el modelo Role para traer los permisos
+                },
+            });
+
+            if (!req.user) {
+                return res.status(401).json({ message: 'No autorizado, usuario no encontrado' });
+            }
+
+            // 4. Si todo es correcto, pasamos al siguiente middleware.
+            next();
+
+        } catch (error) {
+            console.error('Error de autenticación:', error);
+            // Este error puede ocurrir si el token es inválido o ha expirado.
+            return res.status(401).json({ message: 'No autorizado, el token ha fallado' });
+        }
+    }
+
+    // Si no encontramos un token en la cabecera...
+    if (!token) {
+        return res.status(401).json({ message: 'No autorizado, no se encontró un token' });
+    }
+};
+
+
+// Middleware para autorizar basado en permisos específicos (no necesita cambios).
+
+
+export const authorize = (...requiredPermissions) => {
+    return (req, res, next) => {
+        // 1. Verificación de seguridad
+        if (!req.user) {
+            return res.status(401).json({ message: 'No autorizado.' });
+        }
+
+        // 2. Si el objeto Role no existe, el usuario no tiene rol asignado
+        if (!req.user.Role) {
+            return res.status(403).json({ 
+                message: 'Acceso prohibido. El usuario no tiene un rol válido asignado en la base de datos.' 
+            });
+        }
+
+        // --- SE ELIMINÓ EL BYPASS DE ADMIN/TECH AQUÍ ---
+        // Ahora TODOS (incluso los admin) deben tener el permiso asignado en la BD.
+
+        // 3. Verificación de permisos (usando tu estructura original de Objetos y nombre 'permissions')
+        const userPermissions = req.user.Role.permissions || {};
+        
+        // Verificamos si tiene al menos uno de los permisos requeridos
+        const hasPermission = requiredPermissions.some(p => userPermissions[p] === true);
+        
+        if (!hasPermission) {
+            return res.status(403).json({ 
+                message: `No tienes los permisos necesarios. Requeridos: ${requiredPermissions.join(', ')}` 
+            });
+        }
+
+        next();
+    };
+};
+
+export const checkPermission = (permission) => {
+  return async (req, res, next) => {
+    const { user } = req;
+    
+    // 1. Si es admin total, pasa siempre
+    if (user.Role.id === 'role-admin' || user.Role.id === 'role-tech') {
+      return next();
+    }
+
+    // 2. Verificar si el usuario tiene el permiso en su rol
+    const hasPermission = user.Role.permissions[permission];
+
+    if (!hasPermission) {
+      return res.status(403).json({ message: 'No tienes permiso para acceder a este módulo' });
+    }
+
+    // --- LÓGICA ESPECIAL PARA ADMIN2 (SOLO LECTURA) ---
+    // Si el usuario es admin2 y el método NO es GET, bloqueamos la acción
+    if (user.Role.id === 'role-admin2' && req.method !== 'GET') {
+      return res.status(403).json({ 
+        message: 'Acceso denegado: El rol Admin2 solo tiene permisos de lectura.' 
+      });
+    }
+
+    next();
+  };
+};

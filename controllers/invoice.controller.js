@@ -1,0 +1,381 @@
+import { Invoice, CompanyInfo, Client, Office, sequelize, Remesa } from '../models/index.js'; // Importar Office
+import { sendInvoiceToHKA, sendCreditNoteToHKA, sendDebitNoteToHKA, voidInvoiceInHKA, downloadFileFromHKA } from '../services/theFactoryAPI.service.js';
+import { Op } from 'sequelize'; // Importamos Op para usar OR
+
+
+export const getInvoices = async (req, res) => {
+    try {
+        const { user } = req;
+        const whereClause = {};
+
+        const globalRoles = ['role-admin', 'role-tecnologia', 'role-soporte']; 
+
+        // === FILTRO ESTRICTO: SOLO VEO LO QUE CREA MI OFICINA ===
+        if (user && !globalRoles.includes(user.roleId)) {
+            if (user.officeId) {
+                
+                // REGLA: La factura tiene que tener EXACTAMENTE el mismo officeId que el usuario.
+                // Ni Barinas ve lo de Caracas, ni Caracas ve lo de Barinas.
+                whereClause.officeId = user.officeId;
+                
+            } else {
+                // Si el usuario no tiene rol global ni oficina asignada, no ve nada
+                whereClause.id = null;
+            }
+        }
+        // Nota: Los administradores siguen viendo TODO porque el whereClause queda vacío {}.
+
+        const invoices = await Invoice.findAll({ 
+            where: whereClause, 
+            order: [['invoiceNumber', 'DESC']],
+            include: [
+                { model: Office, attributes: ['name', 'code'] },
+                { model: Remesa, attributes: ['remesaNumber', 'date'] } 
+            ]
+        });
+        
+        res.json(invoices);
+    } catch (error) {
+        console.error("Error al obtener las facturas:", error);
+        res.status(500).json({ message: 'Error al obtener las facturas', error: error.message });
+    }
+};
+        
+
+export const createInvoice = async (req, res) => {
+    const t = await sequelize.transaction();
+    try {
+        // 1. Extraemos montoFlete y otros valores del body
+        const { guide, montoFlete, insuranceAmount, discountAmount,specificDestination, ...invoiceData } = req.body;
+        const { sender, receiver } = guide;
+
+        // --- Lógica de Oficina (Original) ---
+        if (req.user.roleId !== 'role-admin') {
+            guide.originOfficeId = req.user.officeId;
+        } else if (!guide.originOfficeId) {
+            guide.originOfficeId = req.user.officeId;
+        }
+
+        const getValidClientData = ({ idNumber, clientType, name, phone, address, email }) => ({
+        idNumber, clientType, name, phone, address, email
+        });
+
+        // --- Persistencia de Clientes (Original) ---
+        const [senderClient] = await Client.findOrCreate({
+            where: { idNumber: sender.idNumber },
+            defaults: { ...getValidClientData(sender), id: `C-${Date.now()}` },
+            transaction: t
+        });
+        const [receiverClient] = await Client.findOrCreate({
+            where: { idNumber: receiver.idNumber },
+            defaults: { ...getValidClientData(receiver), id: `C-${Date.now() + 1}` },
+            transaction: t
+        });
+
+        const userOfficeId = req.user?.officeId;
+        if (!userOfficeId) throw new Error('No se pudo determinar la oficina del usuario.');
+
+        // --- Numeración y Bloqueo de Oficina (Original) ---
+        const office = await Office.findByPk(userOfficeId, { transaction: t, lock: t.LOCK.UPDATE });
+        if (!office || !office.code) throw new Error(`La oficina no tiene un CÓDIGO (Serie) asignado.`);
+        
+        const nextInvoiceNum = (office.lastInvoiceNumber || 0) + 1;
+        const newInvoiceNumberFormatted = `${office.code}-${String(nextInvoiceNum).padStart(6, '0')}`;
+        const newControlNumber = String(nextInvoiceNum).padStart(8, '0');
+        
+        office.lastInvoiceNumber = nextInvoiceNum;
+        await office.save({ transaction: t });
+
+        // =======================================================
+        // NUEVA LÓGICA DE CÁLCULO INTEGRADA
+        // =======================================================
+        
+        // A. Obtener Cargo por Manejo Fijo de la Configuración
+        const company = await CompanyInfo.findByPk(1, { transaction: t });
+        const costoManejoFijo = company ? parseFloat(company.costPerKg || 0) : 0;
+
+        // B. Cálculos de IPOSTEL basados en el peso (Kg)
+        const pesoKg = parseFloat(guide.weight || 0);
+        const fleteIngresado = parseFloat(montoFlete || 0);
+        let calculadoIpostel = 0;
+
+        // Si el peso es menor o igual a 30.9 Kg, se cobra el 1% del flete
+        if (pesoKg <= 30.9) {
+            calculadoIpostel = fleteIngresado * 0.06;
+        }
+
+        // C. Cálculo del Total Final por Seguridad en Backend
+        const seguro = parseFloat(insuranceAmount || 0);
+        const descuento = parseFloat(discountAmount || 0);
+        const subtotalCalculado = fleteIngresado + costoManejoFijo + calculadoIpostel + seguro;
+        const totalFinal = subtotalCalculado + iva - descuento; // <-- NUEVO: Sumar el IVA
+
+        const sanitizedEmail = senderClient.email && senderClient.email.trim() !== "" 
+        ? senderClient.email 
+        : null;
+
+        // --- Creación de Factura (Actualizada con los nuevos campos) ---
+        const newInvoice = await Invoice.create({
+            id: `INV-${Date.now()}`,
+            invoiceNumber: newInvoiceNumberFormatted,
+            controlNumber: newControlNumber,
+            clientName: senderClient.name,
+            clientIdNumber: senderClient.idNumber,
+            clientEmail: sanitizedEmail,
+            date: invoiceData.date,
+
+            // === NUEVOS CAMPOS DEL DESTINATARIO ===
+            specificDestination: specificDestination, // AGREGA ESTA LÍNEA
+            destinationOfficeId: guide.destinationOfficeId || null,
+            receiverName: receiverClient.name,
+            receiverIdNumber: receiverClient.idNumber,
+            receiverAddress: receiverClient.address,
+            receiverPhone: receiverClient.phone,
+            receiverEmail: receiverClient.email,
+            
+            // Montos Desglosados
+            montoFlete: fleteIngresado,    // El monto manual que pediste
+            Montomanejo: costoManejoFijo,  // Cargo fijo desde configuración
+            ipostelFee: calculadoIpostel,  // 1% si peso <= 30.9
+            insuranceAmount: seguro,
+            montoIva: iva,
+            discountAmount: descuento,
+            totalAmount: totalFinal,       // Suma total calculada aquí
+            officeId: userOfficeId,
+
+            guide: { 
+                ...guide, 
+                sender: { ...sender, id: senderClient.id }, 
+                receiver: { ...receiver, id: receiverClient.id } 
+            },
+            status: 'Activa',
+            paymentStatus: guide.paymentType === 'flete-pagado' ? 'Pagada' : 'Pendiente',
+            shippingStatus: 'Pendiente para Despacho',
+            createdByName: invoiceData.createdByName || 'Sistema'
+        }, { transaction: t });
+        
+        await t.commit();
+        res.status(201).json(newInvoice);
+
+    } catch (error) {
+        if (t) await t.rollback();
+        console.error('Error al crear la factura:', error);
+        res.status(500).json({ message: error.message || 'Error al crear la factura' });
+    }
+};
+
+export const updateInvoice = async (req, res) => {
+    try {
+        const invoice = await Invoice.findByPk(req.params.id);
+        if (!invoice) return res.status(404).json({ message: 'Factura no encontrada' });
+        
+        const rateToUse = req.body.exchangeRate || invoice.exchangeRate;
+
+        // 1. Extraemos TODOS los datos financieros para evitar que se filtren sin revisión
+        const { 
+            exchangeRate,
+            totalAmount, 
+            montoFlete, 
+            Montomanejo, 
+            ipostelFee, // Extraído para que no se guarde automáticamente el viejo
+            insuranceAmount, 
+            discountAmount,
+            montoIva,
+            guide, 
+            ...safeUpdateData 
+        } = req.body;
+
+        // 2. Fusionamos la guía vieja de la BD con la nueva (si enviaron cambios)
+        const updatedGuide = guide ? { ...invoice.guide, ...guide } : invoice.guide;
+
+        // 3. Rescatamos los montos (usamos el del front, si no, el viejo de la BD)
+        const fleteIngresado = parseFloat(montoFlete !== undefined ? montoFlete : invoice.montoFlete || 0);
+        const manejo = parseFloat(Montomanejo !== undefined ? Montomanejo : invoice.Montomanejo || 0);
+        const seguro = parseFloat(insuranceAmount !== undefined ? insuranceAmount : invoice.insuranceAmount || 0);
+        const descuento = parseFloat(discountAmount !== undefined ? discountAmount : invoice.discountAmount || 0);
+
+        // 4. ¡LA CLAVE! Buscamos el peso real en la guía actualizada
+        const pesoKg = parseFloat(updatedGuide?.weight || 0);
+
+        // 5. Regla estricta de IPOSTEL (6% según requerimiento legal)
+        let calculadoIpostel = 0;
+        
+        // Solo aplica si el peso es MAYOR a 0 y MENOR o IGUAL a 30.9
+        if (pesoKg > 0 && pesoKg <= 30.9) {
+            calculadoIpostel = fleteIngresado * 0.06;
+        } else if (pesoKg === 0 && ipostelFee !== undefined) {
+            // Failsafe: Si por error de lectura el peso fue 0, respetamos 
+            // estrictamente lo que el frontend ya había calculado
+            calculadoIpostel = parseFloat(ipostelFee);
+        }
+
+        // 6. Recalculamos el Total Final exacto
+        const totalFinal = (fleteIngresado + manejo + calculadoIpostel + seguro) - descuento;
+
+        // 7. Guardamos en Base de Datos forzando los montos correctos
+        await invoice.update({
+            ...safeUpdateData,
+            guide: updatedGuide, 
+            // === NUEVO CAMPO AGREGADO ===
+            destinationOfficeId: updatedGuide?.destinationOfficeId || invoice.destinationOfficeId, 
+            montoFlete: fleteIngresado,
+            Montomanejo: manejo,
+            ipostelFee: calculadoIpostel,
+            insuranceAmount: seguro,
+            montoIva: iva,
+            discountAmount: descuento,
+            totalAmount: totalFinal,
+            exchangeRate: rateToUse
+        });
+        
+        const freshInvoice = await Invoice.findByPk(req.params.id, { include: ['Office'] });
+        
+        res.json(freshInvoice);
+    } catch (error) {
+        console.error('Error en updateInvoice:', error);
+        res.status(500).json({ message: 'Error al actualizar', error: error.message });
+    }
+};
+
+export const deleteInvoice = async (req, res) => {
+    try {
+        // 1. Buscamos la factura incluyendo la Oficina para tener la Serie (code)
+        const invoice = await Invoice.findByPk(req.params.id, { include: [Office] });
+        if (!invoice) return res.status(404).json({ message: 'Factura no encontrada' });
+
+        // 2. LLAMADA AL ENDPOINT DE ANULACIÓN DE HKA
+        // Esta función usa el API_URL_ANULACION que mencionaste
+        const hkaResponse = await voidInvoiceInHKA(invoice);
+
+        // 3. Acción local: En lugar de destroy (borrar), cambiamos el status a 'Anulada'
+        // Esto es mejor para la integridad contable
+        await invoice.update({ status: 'Anulada' });
+
+        res.json({ 
+            message: 'Factura anulada con éxito en sistema y HKA', 
+            hkaResponse 
+        });
+    } catch (error) {
+        console.error(`[HKA Void Error]:`, error.message);
+        res.status(500).json({ 
+            message: 'No se pudo anular en HKA: ' + error.message 
+        });
+    }
+};
+
+// --- ENVÍO DE FACTURA A HKA (CORRECCIÓN DE CARRERA/RACE CONDITION) ---
+export const sendInvoiceToTheFactory = async (req, res) => {
+    try {
+        const invoiceId = req.params.id;
+        
+        // 1. Fetch the invoice to prepare for update (if data is in body)
+        let invoice = await Invoice.findByPk(invoiceId);
+        if (!invoice) return res.status(404).json({ message: 'Factura no encontrada' });
+
+        // 2. CRÍTICO: Actualiza la factura con cualquier dato nuevo que el frontend haya podido enviar 
+        // (En caso de que el frontend intente guardar y enviar en la misma petición).
+        // Esto también asegura que la escritura haya terminado ANTES de la lectura.
+        if (Object.keys(req.body).length > 0) {
+            await invoice.update(req.body);
+        }
+        
+        // 3. Re-fetch la instancia completa con la relación Office y los datos más frescos
+        // Esto garantiza que los campos como montoFlete y clientEmail estén cargados.
+        const freshInvoice = await Invoice.findByPk(invoiceId, { include: [Office] });
+        if (!freshInvoice) return res.status(404).json({ message: 'Factura no encontrada después de recarga' });
+
+
+        const hkaResponse = await sendInvoiceToHKA(freshInvoice);
+        console.log(`[HKA] Factura ${freshInvoice.invoiceNumber} enviada.`);
+        res.status(200).json({ message: 'Factura enviada a HKA.', hkaResponse });
+
+    } catch (error) {
+        console.error(`[HKA] Error factura ${req.params.id}:`, error.message);
+        res.status(500).json({ message: error.message });
+    }
+};
+
+// --- NOTA DE CRÉDITO ---
+export const createCreditNote = async (req, res) => {
+    const { id } = req.params;
+    const { motivo } = req.body;
+    if (!motivo) return res.status(400).json({ message: 'Motivo requerido' });
+
+    try {
+        // Se realiza un re-fetch para asegurar los datos más frescos antes de la nota
+        const invoice = await Invoice.findByPk(id, { include: [Office] });
+        if (!invoice) return res.status(404).json({ message: 'Factura no encontrada' });
+
+        const noteNumber = `NC-${Date.now().toString().slice(-6)}`;
+        const hkaResponse = await sendCreditNoteToHKA(invoice, { noteNumber, reason: motivo });
+
+        res.json({ message: 'Nota Crédito enviada', hkaResponse, noteNumber });
+    } catch (error) {
+        res.status(500).json({ message: error.message });
+    }
+};
+
+// --- NOTA DE DÉBITO ---
+export const createDebitNote = async (req, res) => {
+    const { id } = req.params;
+    const { motivo } = req.body;
+    if (!motivo) return res.status(400).json({ message: 'Motivo requerido' });
+
+    try {
+        // Se realiza un re-fetch para asegurar los datos más frescos antes de la nota
+        const invoice = await Invoice.findByPk(id, { include: [Office] });
+        if (!invoice) return res.status(404).json({ message: 'Factura no encontrada' });
+
+        const noteNumber = `ND-${Date.now().toString().slice(-6)}`;
+        const hkaResponse = await sendDebitNoteToHKA(invoice, { noteNumber, reason: motivo });
+
+        res.json({ message: 'Nota Débito enviada', hkaResponse, noteNumber });
+    } catch (error) {
+        res.status(500).json({ message: error.message });
+    }
+};
+
+export const downloadInvoiceFile = async (req, res) => {
+    try {
+        const { id } = req.params;
+        const { tipoArchivo } = req.body; 
+
+        const invoice = await Invoice.findByPk(id, { include: [Office] });
+        
+        if (!invoice) {
+            return res.status(404).json({ message: 'Factura no encontrada para descargar' });
+        }
+
+        if (!invoice.Office?.code) {
+            return res.status(400).json({ message: 'La oficina de esta factura no tiene Serie (Code) asignada.' });
+        }
+
+        const serie = invoice.Office.code;
+        
+        // CORRECCIÓN: Forzamos 8 dígitos para cumplir con el estándar de HKA
+        // Si tu factura es '000051', esto lo convertirá en '00000051'
+        let rawNumber = invoice.invoiceNumber.split('-')[1] || invoice.invoiceNumber;
+        const numeroDocumento = rawNumber.toString().padStart(8, '0');
+        
+        const tipo = tipoArchivo || 'pdf'; 
+
+        // Log para depuración (ver qué estamos enviando exactamente)
+        console.log(`Intentando descargar de HKA -> Serie: ${serie}, Numero: ${numeroDocumento}, Tipo: ${tipo}`);
+
+        const hkaResponse = await downloadFileFromHKA(serie, numeroDocumento, tipo);
+
+        res.json({ 
+            message: 'Archivo recuperado con éxito', 
+            data: hkaResponse 
+        });
+
+    } catch (error) {
+        console.error('Error en controlador de descarga HKA:', error.message);
+        // Devolvemos el error detallado para que sepas qué respondió HKA
+        res.status(500).json({ 
+            message: 'Error al descargar archivo de HKA', 
+            error: error.message,
+            detalle: error.response?.data || 'Sin detalle adicional'
+        });
+    }
+};

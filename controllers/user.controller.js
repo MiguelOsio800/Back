@@ -81,3 +81,36 @@ export const deleteUser = async (req, res) => {
         res.status(500).json({ message: 'Error al eliminar el usuario', error: error.message });
     }
 };
+
+export const updateProfile = async (req, res) => {
+    try {
+        // Obtenemos el usuario basado en el token, no en req.params
+        const user = await User.findByPk(req.user.id); 
+        
+        if (!user) {
+            return res.status(404).json({ message: 'Usuario no encontrado' });
+        }
+        
+        // Extraemos SOLO los campos seguros que el usuario puede editarse a sí mismo
+        const { name, password } = req.body;
+        
+        const dataToUpdate = {};
+        if (name) dataToUpdate.name = name;
+        
+        // Si mandó contraseña y no está vacía, la actualizamos
+        if (password && password.trim() !== '') {
+             dataToUpdate.password = password; 
+             // (Nota: Asegúrate de que el modelo o un hook haga el hash de la contraseña si no lo hace el controlador)
+        }
+
+        // NO permitimos que el usuario cambie su propio rol, oficina o asociado por aquí
+        
+        await user.update(dataToUpdate);
+        
+        const { password: _, ...userWithoutPassword } = user.toJSON();
+        res.json(userWithoutPassword);
+        
+    } catch (error) {
+        res.status(500).json({ message: 'Error al actualizar el perfil', error: error.message });
+    }
+};

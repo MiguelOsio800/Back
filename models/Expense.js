@@ -10,6 +10,15 @@ const Expense = sequelize.define('Expense', {
         type: DataTypes.DATEONLY,
         allowNull: false,
     },
+    
+    officeId: {
+    type: DataTypes.STRING,
+    allowNull: true, // INDISPENSABLE para seguridad en producción
+    references: {
+      model: 'Offices',
+      key: 'id'
+    }
+    },
     description: {
         type: DataTypes.STRING,
         allowNull: false,

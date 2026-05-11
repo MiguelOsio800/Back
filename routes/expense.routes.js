@@ -7,11 +7,11 @@ const router = express.Router();
 router.use(protect);
 
 router.route('/')
-    .get(authorize('libro-contable.view'), getExpenses)
-    .post(authorize('libro-contable.create'), createExpense);
+    .get(authorize('gastos.view'), getExpenses)      // Cambiado a gastos.*
+    .post(authorize('gastos.create'), createExpense); // Cambiado a gastos.*
 
 router.route('/:id')
-    .put(authorize('libro-contable.edit'), updateExpense)
-    .delete(authorize('libro-contable.delete'), deleteExpense);
+    .put(authorize('gastos.edit'), updateExpense)    // Cambiado a gastos.*
+    .delete(authorize('gastos.delete'), deleteExpense); // Cambiado a gastos.*
 
 export default router;

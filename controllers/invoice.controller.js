@@ -88,7 +88,7 @@ export const createInvoice = async (req, res) => {
         // NOTA: 'iva' se asume que viene calculado desde el frontend o se declara aquí
         const iva = parseFloat(req.body.montoIva || 0); 
         const subtotalCalculado = fleteIngresado + costoManejoFijo + calculadoIpostel + seguro;
-        const totalFinal = subtotalCalculado + iva - descuento;
+        const totalFinal = parseFloat(invoiceData.totalAmount) || (subtotalCalculado + iva - descuento);
 
         const sanitizedEmail = senderClient.email && senderClient.email.trim() !== "" 
         ? senderClient.email 
@@ -176,7 +176,7 @@ export const updateInvoice = async (req, res) => {
             calculadoIpostel = parseFloat(ipostelFee);
         }
 
-        const totalFinal = (fleteIngresado + manejo + calculadoIpostel + seguro + iva) - descuento;
+        const totalFinal = parseFloat(totalAmount) || ((fleteIngresado + manejo + calculadoIpostel + seguro + iva) - descuento);
 
         await invoice.update({
             ...safeUpdateData,
